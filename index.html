@@ -438,9 +438,9 @@
       <textarea id="locInput" placeholder="One per line:
 Building Name, Address
 e.g.
-One Ayala, Ayala Avenue Makati
-Zuellig Building, Makati Ave corner Paseo de Roxas
-RCBC Plaza, Ayala Avenue Makati"></textarea>
+Empire State Building, 350 5th Ave New York NY
+Rockefeller Center, 45 Rockefeller Plaza New York NY
+One World Trade, 285 Fulton St New York NY"></textarea>
 
       <div class="input-row">
         <div class="field">
@@ -459,8 +459,9 @@ RCBC Plaza, Ayala Avenue Makati"></textarea>
 
       <div class="section-label" style="margin-top:14px; margin-bottom:6px;">Travel mode</div>
       <div class="mode-toggle">
-        <button class="mode-btn active" id="modeD" onclick="setMode('driving-car')">🚗 Driving</button>
-        <button class="mode-btn" id="modeW" onclick="setMode('foot-walking')">🚶 Walking</button>
+        <button class="mode-btn active" id="modeD" onclick="setMode('driving-car')">🚗 Drive</button>
+        <button class="mode-btn" id="modeW" onclick="setMode('foot-walking')">🚶 Walk</button>
+        <button class="mode-btn" id="modeB" onclick="setMode('both')">⇄ Both</button>
       </div>
 
       <div class="suggestion-banner" id="suggBanner">
@@ -505,18 +506,19 @@ RCBC Plaza, Ayala Avenue Makati"></textarea>
 const ORS_KEY = 'eyJvcmciOiI1YjNjZTM1OTc4NTExMTAwMDFjZjYyNDgiLCJpZCI6IjBhYjBkMzUwNDZmMTQ4NGU5YTczYjEzY2YxOTJiYTVmIiwiaCI6Im11cm11cjY0In0=';
 
 // WALK_THRESHOLD_KM: if all segments are under this, suggest walking
-const WALK_THRESHOLD_KM = 0.7;
+const WALK_THRESHOLD_KM = 0.4; // ~0.25 miles — typical US walkable city block range
 
 let travelMode = 'driving-car';
 let stops = [];
-let travelSegments = []; // indexed by stop pair, raw data keyed by mode
+// Each entry: { drive: {mins,km,coords}|null, walk: {mins,km,coords}|null }
+let travelSegments = [];
 let map, routeLayer;
 let markers = [];
 
 // --- MAP INIT ---
 // Use a slight delay to ensure DOM is ready
 window.addEventListener('DOMContentLoaded', () => {
-  map = L.map('map', { zoomControl: true }).setView([14.5547, 121.0244], 14);
+  map = L.map('map', { zoomControl: true }).setView([39.5, -98.35], 4);
   L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', {
     attribution: '© OpenStreetMap contributors',
     maxZoom: 19
@@ -527,7 +529,7 @@ function setMode(m) {
   travelMode = m;
   document.getElementById('modeD').classList.toggle('active', m === 'driving-car');
   document.getElementById('modeW').classList.toggle('active', m === 'foot-walking');
-  // Re-render pills if stops are already loaded
+  document.getElementById('modeB').classList.toggle('active', m === 'both');
   if (stops.length > 0) {
     renderStops();
     drawRoute();
@@ -538,9 +540,21 @@ function setMode(m) {
 // --- GEOCODING ---
 // Multiple fallback strategies for geocoding
 async function geocode(query) {
-  // Try 1: ORS geocoding
+  // Try 1: Nominatim — most reliable for US addresses, no rate-key needed
   try {
-    const url = `https://api.openrouteservice.org/geocode/search?api_key=${ORS_KEY}&text=${encodeURIComponent(query)}&size=1&boundary.country=PH`;
+    const url = `https://nominatim.openstreetmap.org/search?format=json&q=${encodeURIComponent(query)}&limit=1&countrycodes=us,ca`;
+    const r = await fetch(url, { headers: { 'Accept-Language': 'en' } });
+    if (r.ok) {
+      const d = await r.json();
+      if (d && d.length > 0) {
+        return { lat: parseFloat(d[0].lat), lng: parseFloat(d[0].lon), label: d[0].display_name, source: 'nominatim' };
+      }
+    }
+  } catch(e) { console.warn('Nominatim geocode failed:', e); }
+
+  // Try 2: ORS as fallback (no country restriction)
+  try {
+    const url = `https://api.openrouteservice.org/geocode/search?api_key=${ORS_KEY}&text=${encodeURIComponent(query)}&size=1`;
     const r = await fetch(url);
     if (r.ok) {
       const d = await r.json();
@@ -550,18 +564,6 @@ async function geocode(query) {
       }
     }
   } catch(e) { console.warn('ORS geocode failed:', e); }
-
-  // Try 2: Nominatim (OpenStreetMap) as fallback
-  try {
-    const url = `https://nominatim.openstreetmap.org/search?format=json&q=${encodeURIComponent(query + ', Philippines')}&limit=1&countrycodes=ph`;
-    const r = await fetch(url, { headers: { 'Accept-Language': 'en' } });
-    if (r.ok) {
-      const d = await r.json();
-      if (d && d.length > 0) {
-        return { lat: parseFloat(d[0].lat), lng: parseFloat(d[0].lon), label: d[0].display_name, source: 'nominatim' };
-      }
-    }
-  } catch(e) { console.warn('Nominatim geocode failed:', e); }
 
   return null;
 }
@@ -651,23 +653,43 @@ function sleep(ms) { return new Promise(r => setTimeout(r, ms)); }
 
 // --- TRAVEL TIME FETCH ---
 async function fetchAllTravelTimes() {
+  const needDrive = travelMode === 'driving-car' || travelMode === 'both';
+  const needWalk  = travelMode === 'foot-walking' || travelMode === 'both';
+
   for (let i = 0; i < stops.length - 1; i++) {
     if (!stops[i].coords || !stops[i+1].coords) {
       updateTravelPill(i, 'error', 'N/A — location missing');
       continue;
     }
     updateTravelPill(i, 'loading', 'fetching…');
-    const result = await getTravelData(stops[i].coords, stops[i+1].coords, travelMode);
-    if (result) {
-      travelSegments[i] = result;
-      const modeLabel = travelMode === 'driving-car' ? 'Driving' : 'Walking';
-      updateTravelPill(i, 'loaded', `${modeLabel}, ${result.mins} min`);
-    } else {
-      updateTravelPill(i, 'error', 'Route unavailable');
-    }
-    if (i < stops.length - 2) await sleep(250);
+
+    const seg = { drive: null, walk: null };
+    if (needDrive) seg.drive = await getTravelData(stops[i].coords, stops[i+1].coords, 'driving-car');
+    if (needWalk)  seg.walk  = await getTravelData(stops[i].coords, stops[i+1].coords, 'foot-walking');
+    travelSegments[i] = seg;
+
+    updateTravelPillFromSeg(i, seg);
+    if (i < stops.length - 2) await sleep(300);
   }
   drawRoute();
+}
+
+function updateTravelPillFromSeg(i, seg) {
+  if (!seg) { updateTravelPill(i, 'error', 'Route unavailable'); return; }
+  if (travelMode === 'driving-car') {
+    seg.drive
+      ? updateTravelPill(i, 'loaded', `Drive, ${seg.drive.mins} min`)
+      : updateTravelPill(i, 'error', 'Route unavailable');
+  } else if (travelMode === 'foot-walking') {
+    seg.walk
+      ? updateTravelPill(i, 'loaded', `Walk, ${seg.walk.mins} min`)
+      : updateTravelPill(i, 'error', 'Route unavailable');
+  } else {
+    // both
+    const d = seg.drive ? `🚗 ${seg.drive.mins}min` : '🚗 N/A';
+    const w = seg.walk  ? `🚶 ${seg.walk.mins}min`  : '🚶 N/A';
+    updateTravelPill(i, 'loaded', `${d}  ·  ${w}`);
+  }
 }
 
 function updateTravelPill(idx, state, text) {
@@ -723,7 +745,11 @@ function checkFit() {
   const windowMins = (weh * 60 + wem) - (wsh * 60 + wsm);
 
   let totalVisit = stops.reduce((s, x) => s + x.duration, 0);
-  let totalTravel = travelSegments.reduce((s, seg) => s + (seg ? seg.mins : 15), 0);
+  let totalTravel = travelSegments.reduce((s, seg) => {
+    if (!seg) return s + 15;
+    if (travelMode === 'foot-walking') return s + (seg.walk ? seg.walk.mins : 20);
+    return s + (seg.drive ? seg.drive.mins : (seg.walk ? seg.walk.mins : 15));
+  }, 0);
   let totalNeeded = totalVisit + totalTravel;
 
   const banner = document.getElementById('fitBanner');
@@ -846,8 +872,15 @@ function renderStops() {
       let pillClass = 'travel-pill';
       let pillText = 'fetching travel time…';
       if (seg) {
-        const modeLabel = travelMode === 'driving-car' ? 'Driving' : 'Walking';
-        pillText = `${modeLabel}, ${seg.mins} min`;
+        if (travelMode === 'driving-car') {
+          pillText = seg.drive ? `Drive, ${seg.drive.mins} min` : 'Drive unavailable';
+        } else if (travelMode === 'foot-walking') {
+          pillText = seg.walk ? `Walk, ${seg.walk.mins} min` : 'Walk unavailable';
+        } else {
+          const d = seg.drive ? `🚗 ${seg.drive.mins}min` : '🚗 N/A';
+          const w = seg.walk  ? `🚶 ${seg.walk.mins}min`  : '🚶 N/A';
+          pillText = `${d}  ·  ${w}`;
+        }
         pillClass = 'travel-pill loaded';
       }
       html += `<div class="travel-seg">
@@ -896,19 +929,27 @@ function plotMarkers() {
 }
 
 // --- DRAW ROUTE ---
+let routeLayerWalk = null;
 function drawRoute() {
   if (routeLayer) { map.removeLayer(routeLayer); routeLayer = null; }
-  const allCoords = [];
+  if (routeLayerWalk) { map.removeLayer(routeLayerWalk); routeLayerWalk = null; }
+
+  const driveCoords = [], walkCoords = [];
   travelSegments.forEach(seg => {
-    if (seg && seg.coords) allCoords.push(...seg.coords);
+    if (!seg) return;
+    if (seg.drive && seg.drive.coords) driveCoords.push(...seg.drive.coords);
+    if (seg.walk  && seg.walk.coords)  walkCoords.push(...seg.walk.coords);
   });
-  if (allCoords.length > 0) {
-    routeLayer = L.polyline(allCoords, {
-      color: travelMode === 'foot-walking' ? '#2563EB' : '#2D5A3D',
-      weight: 3.5,
-      opacity: 0.75,
-      dashArray: travelMode === 'foot-walking' ? '7,7' : null
-    }).addTo(map);
+
+  if (travelMode === 'driving-car' || travelMode === 'both') {
+    if (driveCoords.length > 0) {
+      routeLayer = L.polyline(driveCoords, { color: '#2D5A3D', weight: 3.5, opacity: 0.75 }).addTo(map);
+    }
+  }
+  if (travelMode === 'foot-walking' || travelMode === 'both') {
+    if (walkCoords.length > 0) {
+      routeLayerWalk = L.polyline(walkCoords, { color: '#2563EB', weight: 3, opacity: 0.7, dashArray: '7,7' }).addTo(map);
+    }
   }
 }
 
@@ -934,12 +975,16 @@ function generateItinerary() {
   const [sh, sm] = windowStart.split(':').map(Number);
   let curH = sh, curM = sm;
 
-  const date = new Date().toLocaleDateString('en-PH', { weekday: 'long', year: 'numeric', month: 'long', day: 'numeric' });
-  const modeLabel = travelMode === 'driving-car' ? 'Driving' : 'Walking';
+  const date = new Date().toLocaleDateString('en-US', { weekday: 'long', year: 'numeric', month: 'long', day: 'numeric' });
+  const modeLabel = travelMode === 'driving-car' ? 'Drive' : travelMode === 'foot-walking' ? 'Walk' : 'Drive + Walk';
 
-  // Total time needed
+  // Total time needed — use drive for 'both' scheduling
   let totalVisit = stops.reduce((s, x) => s + x.duration, 0);
-  let totalTravel = travelSegments.reduce((s, seg) => s + (seg ? seg.mins : 15), 0);
+  let totalTravel = travelSegments.reduce((s, seg) => {
+    if (!seg) return s + 15;
+    if (travelMode === 'foot-walking') return s + (seg.walk ? seg.walk.mins : 20);
+    return s + (seg.drive ? seg.drive.mins : (seg.walk ? seg.walk.mins : 15));
+  }, 0);
   let totalMins = totalVisit + totalTravel;
 
   const [weh, wem] = windowEnd.split(':').map(Number);
@@ -972,14 +1017,29 @@ function generateItinerary() {
 
     if (i < stops.length - 1) {
       const seg = travelSegments[i];
-      const tt = seg ? seg.mins : '?';
-      const dist = seg ? ` · ${seg.km} km` : '';
-      const mLabel = travelMode === 'driving-car' ? 'Driving' : 'Walking';
+      let travelLine = '';
+      let travelMins = 15;
+      if (seg) {
+        if (travelMode === 'driving-car' && seg.drive) {
+          travelLine = `Drive, ${seg.drive.mins} min · ${seg.drive.km} km`;
+          travelMins = seg.drive.mins;
+        } else if (travelMode === 'foot-walking' && seg.walk) {
+          travelLine = `Walk, ${seg.walk.mins} min · ${seg.walk.km} km`;
+          travelMins = seg.walk.mins;
+        } else {
+          const dp = seg.drive ? `Drive ${seg.drive.mins}min` : '';
+          const wp = seg.walk  ? `Walk ${seg.walk.mins}min`  : '';
+          travelLine = [dp, wp].filter(Boolean).join('  ·  ');
+          travelMins = seg.drive ? seg.drive.mins : (seg.walk ? seg.walk.mins : 15);
+        }
+      } else {
+        travelLine = 'Travel time unavailable';
+      }
       lines.push('');
-      lines.push(`  → ${mLabel}, ${tt} min${dist}  →  ${stops[i+1].name}`);
+      lines.push(`  → ${travelLine}  →  ${stops[i+1].name}`);
       lines.push('  ──────────────────────────────────────');
       lines.push('');
-      [curH, curM] = addMins(lh, lm, seg ? seg.mins : 15);
+      [curH, curM] = addMins(lh, lm, travelMins);
     } else {
       lines.push('');
       lines.push('══════════════════════════════════════════');
